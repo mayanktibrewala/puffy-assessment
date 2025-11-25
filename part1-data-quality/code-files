@@ -1,0 +1,420 @@
+import os
+import json
+from dataclasses import dataclass
+from typing import List, Dict, Any, Optional
+
+import pandas as pd
+
+
+# ---------------------------
+# Config / Expected Metadata
+# ---------------------------
+
+EXPECTED_COLUMNS = [
+    "client_id",
+    "page_url",
+    "referrer",
+    "timestamp",
+    "event_name",
+    "event_data",
+    "user_agent",
+]
+
+EXPECTED_EVENT_NAMES = {
+    "page_viewed",
+    "email_filled_on_popup",
+    "product_added_to_cart",
+    "checkout_started",
+    # per original spec this should be "purchase",
+    # but our data actually uses "checkout_completed".
+    # We'll treat that as a schema issue in checks.
+    "purchase",
+}
+
+# For “hard” thresholds you’d tune these based on production norms
+MAX_MISSING_ID_PCT_ERROR = 5.0      # >5% events with no client identifier = ERROR
+MAX_MISSING_ID_PCT_WARN = 1.0       # 1–5% = WARN
+MAX_DUP_TX_PCT_WARN = 0.5           # >0.5% duplicate transaction_ids = WARN
+MAX_ZERO_REVENUE_PCT_WARN = 2.0     # >2% of orders with 0 revenue = WARN
+
+
+@dataclass
+class DQIssue:
+    level: str      # "ERROR" or "WARN"
+    check: str
+    message: str
+    sample: Optional[pd.DataFrame] = None  # optional rows for debugging
+
+
+class EventDataQualityValidator:
+    def __init__(self):
+        pass
+
+    # -------------
+    # Entry point
+    # -------------
+    def run_on_dataframe(self, df: pd.DataFrame, partition_label: str = "") -> List[DQIssue]:
+        issues: List[DQIssue] = []
+
+        # Normalize / helper fields (not persisted)
+        df = df.copy()
+        df["__source_partition"] = partition_label or "unknown"
+        df["__has_client_id"] = df.get("client_id").notna() if "client_id" in df.columns else False
+        df["__has_clientId"] = df.get("clientId").notna() if "clientId" in df.columns else False
+
+        # Core checks
+        issues += self.check_schema(df)
+        issues += self.check_timestamps(df)
+        issues += self.check_ids(df)
+        issues += self.check_event_names(df)
+        issues += self.check_checkout_payload(df)
+        issues += self.check_daily_anomalies(df)
+
+        return issues
+
+    # ----------------
+    # Individual checks
+    # ----------------
+
+    def check_schema(self, df: pd.DataFrame) -> List[DQIssue]:
+        issues: List[DQIssue] = []
+
+        cols = set(df.columns)
+        expected = set(EXPECTED_COLUMNS)
+
+        missing = expected - cols
+        unexpected = cols - expected
+
+        if missing:
+            issues.append(DQIssue(
+                level="ERROR",
+                check="schema.columns.missing",
+                message=f"Missing expected columns: {sorted(missing)}",
+            ))
+
+        if unexpected:
+            issues.append(DQIssue(
+                level="WARN",
+                check="schema.columns.unexpected",
+                message=f"Unexpected columns present: {sorted(unexpected)} "
+                        f"(possible schema drift – e.g. new identifiers)",
+            ))
+
+        return issues
+
+    def check_timestamps(self, df: pd.DataFrame) -> List[DQIssue]:
+        issues: List[DQIssue] = []
+
+        if "timestamp" not in df.columns:
+            return [DQIssue(
+                level="ERROR",
+                check="field.timestamp.missing",
+                message="Column 'timestamp' is missing entirely.",
+            )]
+
+        parsed = pd.to_datetime(df["timestamp"], errors="coerce", utc=True)
+        invalid_count = parsed.isna().sum()
+        if invalid_count > 0:
+            pct = invalid_count * 100.0 / len(df)
+            issues.append(DQIssue(
+                level="ERROR",
+                check="field.timestamp.invalid_parse",
+                message=f"{invalid_count} ({pct:.2f}%) rows have unparseable timestamps.",
+                sample=df[parsed.isna()].head(10),
+            ))
+
+        # Partition sanity: if the data is date-partitioned (e.g. by file path),
+        # you can verify all timestamps fall into that partition window here.
+        return issues
+
+    def check_ids(self, df: pd.DataFrame) -> List[DQIssue]:
+        issues: List[DQIssue] = []
+
+        # 1) Schema drift on identifier column names
+        has_client_id_col = "client_id" in df.columns
+        has_clientId_col = "clientId" in df.columns
+
+        if has_clientId_col and not has_client_id_col:
+            issues.append(DQIssue(
+                level="ERROR",
+                check="ids.schema.rename",
+                message="Column 'clientId' exists but 'client_id' does not – "
+                        "breaking backward compatibility with the documented schema.",
+            ))
+
+        if has_clientId_col and has_client_id_col:
+            issues.append(DQIssue(
+                level="WARN",
+                check="ids.schema.both_id_columns",
+                message="Both 'client_id' and 'clientId' columns exist – instrumentation is inconsistent.",
+            ))
+
+        # 2) Missing identifier on individual rows
+        has_any_id = df["__has_client_id"] | df["__has_clientId"]
+        missing_any_id = (~has_any_id)
+        missing_count = missing_any_id.sum()
+        pct = missing_count * 100.0 / len(df)
+
+        if pct > MAX_MISSING_ID_PCT_ERROR:
+            level = "ERROR"
+        elif pct > MAX_MISSING_ID_PCT_WARN:
+            level = "WARN"
+        else:
+            level = None
+
+        if level:
+            issues.append(DQIssue(
+                level=level,
+                check="ids.missing",
+                message=(f"{missing_count} events ({pct:.2f}%) have neither 'client_id' "
+                         f"nor 'clientId' populated."),
+                sample=df[missing_any_id].head(10),
+            ))
+
+        return issues
+
+    def check_event_names(self, df: pd.DataFrame) -> List[DQIssue]:
+        issues: List[DQIssue] = []
+
+        if "event_name" not in df.columns:
+            return [DQIssue(
+                level="ERROR",
+                check="field.event_name.missing",
+                message="Column 'event_name' is missing entirely.",
+            )]
+
+        unique_events = set(df["event_name"].dropna().unique())
+
+        # Which are unknown vs spec
+        unknown = unique_events - EXPECTED_EVENT_NAMES
+        if unknown:
+            issues.append(DQIssue(
+                level="WARN",
+                check="event_name.unknown_values",
+                message=f"Found event_name values not in spec: {sorted(unknown)}. "
+                        f"E.g. 'checkout_completed' vs expected 'purchase'.",
+            ))
+
+        return issues
+
+    def _parse_json_safely(self, s: Any) -> Optional[Dict[str, Any]]:
+        if pd.isna(s):
+            return None
+        if isinstance(s, dict):
+            return s
+        try:
+            return json.loads(s)
+        except Exception:
+            try:
+                # last resort – not ideal for production, but ok here
+                import ast
+                return ast.literal_eval(s)
+            except Exception:
+                return None
+
+    def check_checkout_payload(self, df: pd.DataFrame) -> List[DQIssue]:
+        """
+        Checks specific to purchase / checkout_completed events:
+        - event_data parses as JSON
+        - transaction_id and revenue present
+        - transaction_id uniqueness
+        - basic revenue sanity (non-negative, zero-revenue share)
+        """
+        issues: List[DQIssue] = []
+        if "event_name" not in df.columns or "event_data" not in df.columns:
+            return issues
+
+        # Treat both "purchase" and "checkout_completed" as purchase-type events
+        purchase_mask = df["event_name"].isin(["purchase", "checkout_completed"])
+        purchase_df = df[purchase_mask].copy()
+        if purchase_df.empty:
+            return issues
+
+        purchase_df["ed"] = purchase_df["event_data"].apply(self._parse_json_safely)
+
+        # 1) Unparseable JSON
+        invalid_json_mask = purchase_df["ed"].isna()
+        invalid_count = invalid_json_mask.sum()
+        if invalid_count > 0:
+            pct = invalid_count * 100.0 / len(purchase_df)
+            issues.append(DQIssue(
+                level="ERROR",
+                check="purchase.event_data.invalid_json",
+                message=f"{invalid_count} ({pct:.2f}%) purchase events have invalid JSON in event_data.",
+                sample=purchase_df[invalid_json_mask].head(10),
+            ))
+
+        # 2) Missing transaction_id / revenue
+        purchase_df["transaction_id"] = purchase_df["ed"].apply(
+            lambda d: d.get("transaction_id") if isinstance(d, dict) else None
+        )
+        purchase_df["revenue"] = purchase_df["ed"].apply(
+            lambda d: d.get("revenue") if isinstance(d, dict) else None
+        )
+
+        missing_tx_mask = purchase_df["transaction_id"].isna()
+        missing_rev_mask = purchase_df["revenue"].isna()
+
+        if missing_tx_mask.any():
+            cnt = missing_tx_mask.sum()
+            pct = cnt * 100.0 / len(purchase_df)
+            issues.append(DQIssue(
+                level="ERROR",
+                check="purchase.transaction_id.missing",
+                message=f"{cnt} ({pct:.2f}%) purchase events missing transaction_id.",
+                sample=purchase_df[missing_tx_mask].head(10),
+            ))
+
+        if missing_rev_mask.any():
+            cnt = missing_rev_mask.sum()
+            pct = cnt * 100.0 / len(purchase_df)
+            issues.append(DQIssue(
+                level="ERROR",
+                check="purchase.revenue.missing",
+                message=f"{cnt} ({pct:.2f}%) purchase events missing revenue.",
+                sample=purchase_df[missing_rev_mask].head(10),
+            ))
+
+        # Only proceed with rows that have revenue set
+        valid_rev = purchase_df[~missing_rev_mask].copy()
+        # 3) Negative or zero revenue sanity
+        neg_rev_mask = valid_rev["revenue"] < 0
+        if neg_rev_mask.any():
+            cnt = neg_rev_mask.sum()
+            issues.append(DQIssue(
+                level="ERROR",
+                check="purchase.revenue.negative",
+                message=f"{cnt} purchase events have negative revenue.",
+                sample=valid_rev[neg_rev_mask].head(10),
+            ))
+
+        zero_rev_mask = valid_rev["revenue"] == 0
+        if zero_rev_mask.any():
+            cnt = zero_rev_mask.sum()
+            pct = cnt * 100.0 / len(valid_rev)
+            if pct > MAX_ZERO_REVENUE_PCT_WARN:
+                issues.append(DQIssue(
+                    level="WARN",
+                    check="purchase.revenue.zero_fraction",
+                    message=f"{cnt} purchase events ({pct:.2f}%) have revenue=0. "
+                            f"Check for test orders / coupon edge cases.",
+                    sample=valid_rev[zero_rev_mask].head(10),
+                ))
+
+        # 4) Duplicate transaction_ids (dedup / double-counting risk)
+        dup_counts = valid_rev["transaction_id"].value_counts()
+        dup_ids = dup_counts[dup_counts > 1].index.tolist()
+        if dup_ids:
+            dup_df = valid_rev[valid_rev["transaction_id"].isin(dup_ids)].copy()
+            pct = len(dup_ids) * 100.0 / valid_rev["transaction_id"].nunique()
+            issues.append(DQIssue(
+                level="WARN",
+                check="purchase.transaction_id.duplicates",
+                message=f"{len(dup_ids)} transaction_ids are duplicated "
+                        f"({pct:.2f}% of distinct orders). This can double-count revenue "
+                        f"unless deduplicated upstream.",
+                sample=dup_df.sort_values(["transaction_id", "timestamp"]).head(20),
+            ))
+
+            # Check for conflicting revenue for same transaction_id
+            inconsistent_ids = []
+            for tx, group in dup_df.groupby("transaction_id"):
+                if len(set(group["revenue"])) > 1:
+                    inconsistent_ids.append(tx)
+            if inconsistent_ids:
+                bad = dup_df[dup_df["transaction_id"].isin(inconsistent_ids)]
+                issues.append(DQIssue(
+                    level="ERROR",
+                    check="purchase.transaction_id.conflicting_revenue",
+                    message=f"{len(inconsistent_ids)} duplicated transaction_ids have conflicting "
+                            f"revenue values: {inconsistent_ids}.",
+                    sample=bad.sort_values(["transaction_id", "timestamp"]).head(20),
+                ))
+
+        return issues
+
+    def check_daily_anomalies(self, df: pd.DataFrame) -> List[DQIssue]:
+        """
+        Lightweight anomaly check:
+        - Computes per-day total events & revenue (if available)
+        - Flags very large swings vs median (simple z-score-ish heuristic)
+        This is more of a WARN-level guardrail.
+        """
+        issues: List[DQIssue] = []
+        if "timestamp" not in df.columns:
+            return issues
+
+        df = df.copy()
+        df["__ts"] = pd.to_datetime(df["timestamp"], errors="coerce", utc=True)
+        df["__date"] = df["__ts"].dt.date
+
+        # Daily event volume
+        daily_counts = df.groupby("__date").size()
+        if len(daily_counts) >= 4:
+            median = daily_counts.median()
+            mad = (daily_counts - median).abs().median() or 1
+            z_like = (daily_counts - median) / mad
+
+            outliers = daily_counts[abs(z_like) >= 5]  # very rough, tune if needed
+            if not outliers.empty:
+                issues.append(DQIssue(
+                    level="WARN",
+                    check="anomaly.daily_volume",
+                    message="Daily event volume outliers detected "
+                            f"(vs median {median:.1f}): "
+                            + ", ".join(f"{d}: {c} events" for d, c in outliers.items()),
+                ))
+
+        # Daily revenue if purchase events exist
+        if "event_name" in df.columns and "event_data" in df.columns:
+            purchase_mask = df["event_name"].isin(["purchase", "checkout_completed"])
+            if purchase_mask.any():
+                tmp = df[purchase_mask].copy()
+                tmp["ed"] = tmp["event_data"].apply(self._parse_json_safely)
+                tmp["revenue"] = tmp["ed"].apply(
+                    lambda d: d.get("revenue") if isinstance(d, dict) else None
+                )
+                rev_daily = tmp.groupby("__date")["revenue"].sum()
+
+                if len(rev_daily) >= 4:
+                    median = rev_daily.median()
+                    mad = (rev_daily - median).abs().median() or 1
+                    z_like = (rev_daily - median) / mad
+                    outliers = rev_daily[abs(z_like) >= 5]
+                    if not outliers.empty:
+                        issues.append(DQIssue(
+                            level="WARN",
+                            check="anomaly.daily_revenue",
+                            message="Daily revenue outliers detected "
+                                    f"(vs median {median:.1f}): "
+                                    + ", ".join(f"{d}: {v:.2f}" for d, v in outliers.items()),
+                        ))
+
+        return issues
+
+
+# -------------------------
+# Example usage on the 14d
+# -------------------------
+
+if __name__ == "__main__":
+    base_dir = "/mnt/data"  # adjust as needed
+
+    # load all daily files
+    files = sorted(f for f in os.listdir(base_dir)
+                   if f.startswith("events_") and f.endswith(".csv"))
+    all_df_list = []
+    for f in files:
+        path = os.path.join(base_dir, f)
+        df = pd.read_csv(path)
+        all_df_list.append(df)
+
+    full_df = pd.concat(all_df_list, ignore_index=True)
+
+    validator = EventDataQualityValidator()
+    issues = validator.run_on_dataframe(full_df, partition_label="2025-02-23_to_2025-03-08")
+
+    # Print summary report
+    print("=== DATA QUALITY REPORT ===")
+    for i, issue in enumerate(issues, 1):
+        print(f"{i:02d}. [{issue.level}] {issue.check}: {issue.message}")

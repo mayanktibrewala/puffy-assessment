@@ -1,0 +1,121 @@
+1. Performance Snapshot (14 Days)
+Top-line
+Metric	Value (14 days)	What it tells us
+Unique visitors (devices)	~35,300	Healthy interest / reach
+Pageviews	45,974	~3.3 pageviews per visitor
+Orders (deduped)	290	~21 orders per day
+Revenue	≈ 288.8k	~20.6k revenue per day
+Average order value (AOV)	≈ 996	Ticket size is strong
+Sitewide conversion (views→order)	0.63%	Main weakness: not enough visitors converting
+Funnel (site-wide)
+From all pageviews over these 14 days:
+Step	Count	Rate vs previous step
+Pageviews	45,974	–
+Add to cart	2,307	5.0% of pageviews
+Checkout started	836	36% of add-to-carts
+Orders (deduped)	290	34.7% of checkouts
+Overall view → order		0.63% of pageviews
+Headline:
+We have good traffic and AOV, but conversion is low and we’re losing people heavily between cart → checkout → payment.
+ 
+2. What’s Working
+2.1 Strong basket economics (AOV)
+•	AOV of ~996 is healthy for this category.
+•	Revenue is well spread across days; no single outlier spike. 1 March is the best day, but not an anomaly.
+•	This means: if we fix conversion, the revenue upside is meaningful without needing much higher traffic.
+2.2 Top-of-funnel acquisition
+From pageview referrers:
+Channel (simplified)	Share of pageviews
+Direct	75%
+Organic Search	9.6%
+Paid / Affiliate	8.9%
+Internal navigation	6.0%
+Referral + Social	~0.3%
+Implications:
+•	Brand / direct traffic is strong – three out of four sessions come directly (no external referrer). People know or remember the brand.
+•	Paid / Affiliate and Organic Search together drive ~18–19% of traffic, which is meaningful given this is only a 14-day slice.
+•	The marketing engine is bringing in high-intent visitors; the main problem is converting them, not finding them.
+2.3 Marketing impact on revenue
+Using a 7-day lookback:
+•	≈26% of orders (76 of 290) had at least one non-direct marketing touch (Paid/Affiliate, Organic Search, Referral) in the last 7 days.
+•	Those orders contributed ≈87k in revenue, i.e. about 30% of total revenue.
+Among marketing-influenced revenue (~87k):
+•	First-click view:
+o	~52% from Paid / Affiliate
+o	~40% from Organic Search
+o	~8% from Referral
+•	Last-click view:
+o	~63% from Paid / Affiliate
+o	~29% from Organic Search
+o	~8% from Referral
+So:
+•	Paid / Affiliate is doing the heavy lifting both in introducing and closing customers.
+•	Organic Search is a critical discovery channel and should be actively protected and grown.
+•	The remaining ~70% of revenue appears brand-led (direct/internal paths) under this 7-day view, which is a good sign for brand strength.
+2.4 Building an owned audience
+•	552 email sign-ups (email_filled_on_popup) over 14 days.
+•	That is ~1.2% of pageviews converting to email.
+This gives us a growing base for flows and remarketing (abandoned cart, winback, cross-sell) – important given the current reliance on direct traffic and paid acquisition.
+ 
+3. What’s Concerning (Where We’re Leaking Value)
+3.1 Low overall conversion
+•	0.63% view → order is low by typical e-commerce standards.
+•	For our AOV, a more sustainable range is 1.5–3%.
+•	Even moving from 0.63% → 1.2% would roughly double orders at current traffic.
+This is the single biggest performance gap.
+3.2 Mid- and bottom-funnel friction
+Funnel conversion:
+•	5.0% of visitors add a product to cart.
+•	But only:
+o	36% of carts proceed to checkout, and
+o	35% of checkouts turn into completed orders.
+In plain language:
+Out of 100 people who show serious purchase intent (add to cart), only ~13–14 actually buy.
+Likely causes (to be validated with UX and customer feedback):
+•	Extra friction in checkout (forms, steps, page load times).
+•	Surprise elements at the end:
+o	Shipping fees, taxes, or lack of clarity on returns/warranty.
+•	Trust & reassurance missing at the moment they enter card details (payment options, security logos, guarantees).
+This is where the fastest revenue gains lie: improving the experience from cart → checkout → payment.
+3.3 Mobile underperformance
+Device performance:
+Device	Pageviews	Orders	Conversion (views → order)
+Mobile	31,026	180	0.58%
+Desktop	12,809	107	0.84%
+Other	2,139	3	0.14%
+•	Mobile drives about two-thirds of traffic, but converts ~30% worse than desktop.
+•	Any improvement here has outsized impact: a 20% relative uplift in mobile conversion would add more revenue than the same uplift on desktop.
+Likely areas to investigate:
+•	Page load speed on mobile (especially PDP and checkout).
+•	Clarity of information above the fold.
+•	Placement and size of “Add to Cart” and “Checkout” buttons.
+•	Payment UX on mobile (UPI/wallets, autofill, saved cards, etc., depending on market).
+3.4 Attribution blind spots
+•	Only ~26% of orders can clearly be tied to a non-direct touch within the 7-day window.
+•	For marketing decisioning, relying only on last-click will:
+o	Over-credit Direct/Internal, and
+o	Under-credit Paid / Affiliate and Organic Search, which are clearly driving a big part of first contact.
+This doesn’t mean marketing isn’t working; it means our visibility is limited. As we scale spend, getting this right will be essential to avoid cutting channels that are actually profitable.
+ 
+4. Where to Focus Next (Priority Actions)
+If management wants maximum impact from this data, the top priorities should be:
+1.	Fix the bottom of the funnel (checkout experience)
+o	Simplify and streamline checkout steps.
+o	Make shipping, taxes, returns, and warranty transparent before payment step.
+o	Add strong trust signals (reviews, guarantees, secure payment badges).
+2.	Optimise the mobile experience
+o	Treat mobile PDP and checkout as the “main store”.
+o	Improve load times, readability, and thumb-friendly CTAs.
+o	Test mobile-optimised payment options and flows.
+3.	Strengthen owned channels (email & remarketing)
+o	Build robust email flows: abandoned cart, browse abandonment, post-purchase cross-sell.
+o	Given we’re already capturing ~40 emails/day, this can materially improve conversion and repeat purchase.
+4.	Use both first-click and last-click views in marketing decisions
+o	Last-click to understand what closes sales.
+o	First-click to see which channels actually bring new customers into the ecosystem.
+o	This prevents us from over-investing in “closer” channels and under-investing in genuine discovery channels like Paid/Affiliate and Organic Search.
+ 
+Bottom line for leadership:
+•	The brand already attracts meaningful traffic and strong order values.
+•	The main opportunity is to turn more of today’s visitors into buyers, especially on mobile and especially between cart and payment.
+•	With relatively modest UX and funnel improvements, plus smarter attribution-driven marketing decisions, this same traffic level can support substantially higher revenue.

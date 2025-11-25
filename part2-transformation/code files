@@ -1,0 +1,397 @@
+1. stg_events – clean + canonicalize
+Goal: One canonical event table with consistent user_id, parsed timestamps, and a basic marketing channel dimension.
+-- models/stg_events.sql
+
+with raw as (
+    select
+        -- Canonical user identifier (handles future schema drift like clientId)
+        coalesce(client_id, clientId)          as user_id,
+        page_url,
+        referrer,
+        timestamp                              as raw_timestamp,
+        cast(timestamp as timestamp)           as event_ts,   -- cast to TIMESTAMP type
+        event_name,
+        event_data,
+        user_agent
+    from raw.events
+),
+
+-- Parse JSON payload once
+parsed as (
+    select
+        user_id,
+        page_url,
+        referrer,
+        event_ts,
+        event_name,
+        event_data,
+        user_agent,
+
+        -- Example: parse JSON using generic JSON_EXTRACT_SCALAR style;
+        -- adapt to your warehouse if syntax differs
+        try_cast(json_extract_path_text(event_data, 'transaction_id') as varchar) as transaction_id,
+        try_cast(json_extract_path_text(event_data, 'revenue')        as numeric) as revenue,
+
+        json_extract_path_text(event_data, 'utm_source')   as utm_source,
+        json_extract_path_text(event_data, 'utm_medium')   as utm_medium,
+        json_extract_path_text(event_data, 'utm_campaign') as utm_campaign
+    from raw
+),
+
+-- Derive marketing channel from UTM first, then referrer
+channels as (
+    select
+        *,
+        case
+            when utm_medium in ('cpc','paid_search') then 'Paid Search'
+            when utm_medium in ('paid_social','social') then 'Paid Social'
+            when utm_medium = 'email' then 'Email'
+            when utm_medium = 'display' then 'Display'
+            when utm_source is not null then 'Other Paid'
+            when referrer is null or referrer = '' then 'Direct'
+            when referrer like '%google.%' then 'Organic Search'
+            when referrer like '%facebook.%' or referrer like '%instagram.%' then 'Social'
+            else 'Referral'
+        end as channel
+    from parsed
+)
+
+select
+    -- natural key(s)
+    user_id,
+    page_url,
+    referrer,
+    event_ts,
+    date(event_ts)              as event_date,
+    event_name,
+    event_data,
+    user_agent,
+
+    -- commerce fields
+    transaction_id,
+    revenue,
+
+    -- marketing fields
+    utm_source,
+    utm_medium,
+    utm_campaign,
+    channel
+from channels;
+This model is the single source of truth for all downstream models: sessions, users, orders, attribution.
+ 
+2. fct_sessions – sessionization
+Goal: Build sessions using a 30-minute inactivity timeout per user.
+-- models/fct_sessions.sql
+
+with events as (
+    select
+        -- add a synthetic event_id for convenience
+        row_number() over (order by event_ts, user_id) as event_id,
+        *
+    from {{ ref('stg_events') }}
+),
+
+ordered as (
+    select
+        e.*,
+        lag(event_ts)  over (partition by user_id order by event_ts) as prev_event_ts
+    from events e
+),
+
+flagged as (
+    select
+        *,
+        case
+            when prev_event_ts is null then 1
+            when datediff('minute', prev_event_ts, event_ts) > 30 then 1
+            else 0
+        end as is_new_session
+    from ordered
+),
+
+sessionized as (
+    select
+        *,
+        -- session_seq increments whenever is_new_session = 1
+        sum(is_new_session) over (
+            partition by user_id
+            order by event_ts
+            rows between unbounded preceding and current row
+        ) as session_seq
+    from flagged
+)
+
+select
+    -- session id: user_id + session_seq
+    user_id,
+    concat(user_id, '_', session_seq)      as session_id,
+
+    min(event_ts)                          as session_start_ts,
+    max(event_ts)                          as session_end_ts,
+    date(min(event_ts))                    as session_date,
+    count(*)                               as event_count,
+
+    -- session classifications
+    min(channel)                           as entry_channel,
+    min(utm_source)                        as entry_utm_source,
+    min(utm_medium)                        as entry_utm_medium,
+    min(utm_campaign)                      as entry_utm_campaign,
+
+    -- device approx from user_agent (very simplistic)
+    max(case
+            when user_agent ilike '%Mobile%' or user_agent ilike '%Android%' or user_agent ilike '%iPhone%' then 'Mobile'
+            else 'Desktop'
+        end)                               as device_type
+from sessionized
+group by user_id, session_seq;
+ 
+3. fct_session_events – link events to sessions
+Goal: Every event knows which session it belongs to.
+-- models/fct_session_events.sql
+
+with sessionized as (
+    -- re-use the same logic as fct_sessions, but keep per-event rows
+    with events as (
+        select
+            row_number() over (order by event_ts, user_id) as event_id,
+            *
+        from {{ ref('stg_events') }}
+    ),
+    ordered as (
+        select
+            e.*,
+            lag(event_ts)  over (partition by user_id order by event_ts) as prev_event_ts
+        from events e
+    ),
+    flagged as (
+        select
+            *,
+            case
+                when prev_event_ts is null then 1
+                when datediff('minute', prev_event_ts, event_ts) > 30 then 1
+                else 0
+            end as is_new_session
+        from ordered
+    )
+    select
+        *,
+        sum(is_new_session) over (
+            partition by user_id
+            order by event_ts
+            rows between unbounded preceding and current row
+        ) as session_seq
+    from flagged
+)
+
+select
+    row_number() over (order by event_ts, user_id)  as event_id,
+    user_id,
+    concat(user_id, '_', session_seq)               as session_id,
+    event_ts,
+    event_date,
+    event_name,
+    page_url,
+    referrer,
+    user_agent,
+    channel,
+    utm_source,
+    utm_medium,
+    utm_campaign,
+    transaction_id,
+    revenue,
+    event_data
+from sessionized;
+ 
+4. dim_users – user grain
+Goal: Basic user-level table for behavior analysis.
+-- models/dim_users.sql
+
+with events as (
+    select * from {{ ref('stg_events') }}
+)
+
+select
+    user_id,
+
+    min(event_ts)                       as first_seen_ts,
+    max(event_ts)                       as last_seen_ts,
+    count(*)                            as total_events,
+    count(distinct date(event_ts))      as active_days,
+
+    count_if(event_name = 'page_viewed')               as page_views,
+    count_if(event_name = 'product_added_to_cart')     as adds_to_cart,
+    count_if(event_name in ('checkout_started'))       as checkouts_started,
+    count_if(event_name in ('purchase','checkout_completed')) as purchases,
+
+    sum(case when event_name in ('purchase','checkout_completed') then revenue end) as total_revenue
+from events
+group by user_id;
+ 
+5. fct_orders – order fact table
+Goal: One row per order (conversion event).
+-- models/fct_orders.sql
+
+with events as (
+    select * from {{ ref('stg_events') }}
+),
+
+purchases as (
+    select
+        -- if transaction_id can repeat, we keep the last event per id
+        transaction_id,
+        max(event_ts) filter (where event_name in ('purchase','checkout_completed')) as order_ts,
+        max(user_id)       as user_id,
+        max(channel)       as order_channel_raw,
+        max(utm_source)    as order_utm_source,
+        max(utm_medium)    as order_utm_medium,
+        max(utm_campaign)  as order_utm_campaign,
+        max(revenue)       as revenue
+    from events
+    where event_name in ('purchase','checkout_completed')
+    group by transaction_id
+)
+
+select
+    transaction_id                  as order_id,
+    user_id,
+    order_ts,
+    date(order_ts)                  as order_date,
+    revenue,
+    order_channel_raw,
+    order_utm_source,
+    order_utm_medium,
+    order_utm_campaign
+from purchases;
+ 
+6. fct_marketing_touches – all eligible touchpoints
+Goal: For attribution, we need all marketing touchpoints (visits) that can get credit.
+Definition: a touch is a session-entry event with a non-direct channel.
+-- models/fct_marketing_touches.sql
+
+with se as (
+    select * from {{ ref('fct_session_events') }}
+),
+
+session_entry_events as (
+    -- first event in each session is the "entry" touch
+    select
+        se.*,
+        row_number() over (
+            partition by session_id
+            order by event_ts
+        ) as rn
+    from se
+),
+
+touches as (
+    select
+        session_id,
+        user_id,
+        event_ts     as touch_ts,
+        date(event_ts) as touch_date,
+        channel,
+        utm_source,
+        utm_medium,
+        utm_campaign
+    from session_entry_events
+    where rn = 1
+      and channel is not null
+      and channel <> 'Direct'
+)
+
+select
+    row_number() over (order by touch_ts, user_id) as touch_id,
+    *
+from touches;
+ 
+7. fct_order_attribution – first-click + last-click with 7-day lookback
+Goal: For each order, find the first and last paid touch in the prior 7 days (same user).
+-- models/fct_order_attribution.sql
+
+with orders as (
+    select * from {{ ref('fct_orders') }}
+),
+
+touches as (
+    select * from {{ ref('fct_marketing_touches') }}
+),
+
+eligible_touches as (
+    -- For each order, all touches from same user within [order_ts - 7d, order_ts]
+    select
+        o.order_id,
+        o.user_id,
+        o.order_ts,
+        o.revenue,
+
+        t.touch_id,
+        t.session_id,
+        t.touch_ts,
+        t.channel,
+        t.utm_source,
+        t.utm_medium,
+        t.utm_campaign
+    from orders o
+    join touches t
+        on o.user_id = t.user_id
+       and t.touch_ts between (o.order_ts - interval '7 day') and o.order_ts
+),
+
+ranked_first_last as (
+    select
+        *,
+        row_number() over (
+            partition by order_id
+            order by touch_ts asc, touch_id asc
+        ) as rn_first,
+
+        row_number() over (
+            partition by order_id
+            order by touch_ts desc, touch_id desc
+        ) as rn_last
+    from eligible_touches
+),
+
+first_click as (
+    select
+        order_id,
+        user_id,
+        order_ts,
+        revenue,
+        'first_click'              as model,
+        touch_id,
+        session_id,
+        touch_ts,
+        channel,
+        utm_source,
+        utm_medium,
+        utm_campaign
+    from ranked_first_last
+    where rn_first = 1
+),
+
+last_click as (
+    select
+        order_id,
+        user_id,
+        order_ts,
+        revenue,
+        'last_click'               as model,
+        touch_id,
+        session_id,
+        touch_ts,
+        channel,
+        utm_source,
+        utm_medium,
+        utm_campaign
+    from ranked_first_last
+    where rn_last = 1
+)
+
+select * from first_click
+union all
+select * from last_click;
+The marketing team can now roll up revenue by model + channel + utm_source etc for both first-click and last-click views.
+ 
+
+

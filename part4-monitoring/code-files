@@ -1,164 +1,265 @@
-Below is a concise Python script that assumes a daily_metrics table like:
-event_date, events, users, pageviews,
-add_to_cart, checkout_started,
-orders, revenue,
-pct_missing_user_id,
-duplicate_orders,
-attributed_orders, attributed_revenue
-You’d run this in Airflow/dbt Cloud after your models finish.
+"""
+monitor_daily_metrics.py
+
+Daily production monitoring for the analytics pipeline.
+
+- Reads last 8 days of metrics from `daily_metrics`
+- Checks:
+    - Data presence (yesterday row exists)
+    - Volume metrics (events, users, sessions, orders, revenue)
+    - Funnel metrics (add_to_cart, checkout, purchase)
+    - Attribution coverage
+- Uses median + MAD for anomaly detection.
+- Exits:
+    - 0 if only OK/WARN
+    - 1 if any CRITICAL issue
+"""
+
+import os
 import sys
-import statistics
+from dataclasses import dataclass
+from typing import List, Tuple
+
 import pandas as pd
-from sqlalchemy import create_engine, text  # adapt to your warehouse
+from sqlalchemy import create_engine, text
 
-# --- Config ---
-DAYS_HISTORY = 8       # 7-day baseline + today
-CRIT_DROP_FRACTION = 0.2
-WARN_DROP_FRACTION = 0.5
-CRIT_Z = 6.0
-WARN_Z = 4.0
+# ---------------- Config ----------------
 
-ENGINE = create_engine("postgresql://user:pass@host:5432/db")  # example
-
-
-def mad(values):
-    """Median Absolute Deviation."""
-    med = statistics.median(values)
-    devs = [abs(v - med) for v in values]
-    m = statistics.median(devs)
-    return m if m != 0 else 1.0
+@dataclass
+class Thresholds:
+    crit_drop_fraction: float = 0.3   # <30% of median → critical if z also extreme
+    warn_drop_fraction: float = 0.6   # <60% of median → warn if z moderate
+    crit_z: float = -5.0
+    warn_z: float = -3.0
+    min_baseline_days: int = 5        # need at least this many days to trust baseline
 
 
-def z_score(today, history):
-    if len(history) < 3:
-        return 0.0
-    return (today - statistics.median(history)) / mad(history)
+METRICS_VOLUME = ["events", "users", "sessions", "orders", "revenue"]
+METRICS_FUNNEL = [
+    "add_to_cart_users",
+    "checkout_users",
+    "purchase_users",
+]
+# conversions will be computed from these:
+# add_rate        = add_to_cart_users / users
+# checkout_rate   = checkout_users / add_to_cart_users
+# purchase_rate   = purchase_users / checkout_users
 
 
-def fetch_daily_metrics():
-    q = text("""
-        select *
-        from daily_metrics
-        order by event_date desc
-        limit :limit
-    """)
-    with ENGINE.connect() as conn:
-        df = pd.read_sql(q, conn, params={"limit": DAYS_HISTORY})
-    return df.sort_values("event_date").reset_index(drop=True)
+# ---------------- Helpers ----------------
 
-
-def main():
-    df = fetch_daily_metrics()
-    if df.empty:
-        print("[CRITICAL] daily_metrics is empty.")
+def get_engine():
+    db_url = os.getenv("ANALYTICS_DB_URL")
+    if not db_url:
+        print("ERROR: ANALYTICS_DB_URL env var not set.", file=sys.stderr)
         sys.exit(1)
+    return create_engine(db_url)
 
-    history = df.iloc[:-1].copy()
-    today = df.iloc[-1].copy()
-    date_today = today["event_date"]
 
-    alerts = []
-    critical = False
+def fetch_daily_metrics(engine) -> pd.DataFrame:
+    """
+    Fetch last 8 days (including yesterday) from daily_metrics.
+    Assumes event_date is a DATE column.
+    """
+    query = text("""
+        SELECT
+            event_date,
+            events,
+            users,
+            sessions,
+            orders,
+            revenue,
+            add_to_cart_users,
+            checkout_users,
+            purchase_users,
+            attributed_orders_first_click,
+            attributed_revenue_first_click,
+            attributed_orders_last_click,
+            attributed_revenue_last_click
+        FROM daily_metrics
+        WHERE event_date >= current_date - interval '8 days'
+        ORDER BY event_date
+    """)
+    df = pd.read_sql(query, engine)
+    return df
 
-    def check_volume(metric):
-        nonlocal critical
-        if metric not in df.columns:
-            return
-        hist_vals = history[metric].astype(float).tolist()
-        today_val = float(today[metric])
-        if not hist_vals:
-            return
-        base_med = statistics.median(hist_vals)
-        if base_med <= 0:
-            return
 
-        frac = today_val / base_med
-        z = z_score(today_val, hist_vals)
+def median_mad(series: pd.Series) -> Tuple[float, float]:
+    """Return median and MAD (median absolute deviation)."""
+    median = float(series.median())
+    mad = float((series - median).abs().median())
+    return median, mad
 
-        if today_val == 0:
-            alerts.append(f"[CRITICAL] {metric} is zero on {date_today}.")
-            critical = True
-        elif frac < CRIT_DROP_FRACTION or abs(z) >= CRIT_Z:
-            alerts.append(
-                f"[CRITICAL] {metric}={today_val:.1f} vs median {base_med:.1f} "
-                f"(z≈{z:.1f}, frac={frac:.2f})."
-            )
-            critical = True
-        elif frac < WARN_DROP_FRACTION or abs(z) >= WARN_Z:
-            alerts.append(
-                f"[WARN] {metric}={today_val:.1f} vs median {base_med:.1f} "
-                f"(z≈{z:.1f}, frac={frac:.2f})."
-            )
 
-    # 1) Volume / ingestion
-    for metric in ["events", "users", "orders", "revenue"]:
-        check_volume(metric)
+def check_metric_drop(
+    metric_name: str,
+    baseline: pd.Series,
+    today_value: float,
+    thresholds: Thresholds
+) -> Tuple[str, str]:
+    """
+    Compare today's value vs baseline.
+    Returns (level, message) where level ∈ {'OK','WARN','CRITICAL'}.
+    """
+    if len(baseline) < thresholds.min_baseline_days:
+        return "OK", f"{metric_name}: baseline too short for anomaly detection."
 
-    # 2) Data quality
-    pct_missing = float(today.get("pct_missing_user_id", 0) or 0)
-    if pct_missing > 0.10:
-        alerts.append(f"[CRITICAL] pct_missing_user_id={pct_missing:.2%} (>10%).")
-        critical = True
-    elif pct_missing > 0.05:
-        alerts.append(f"[WARN] pct_missing_user_id={pct_missing:.2%} (>5%).")
+    median, mad = median_mad(baseline)
+    if mad == 0:
+        # No variation; only treat extreme drops as issues
+        if today_value < median * thresholds.crit_drop_fraction:
+            return "CRITICAL", f"{metric_name}: {today_value} vs stable median {median:.2f}."
+        return "OK", f"{metric_name}: stable (median={median:.2f}, today={today_value})."
 
-    dup_orders = int(today.get("duplicate_orders", 0) or 0)
-    if dup_orders > 0:
-        alerts.append(f"[CRITICAL] duplicate_orders={dup_orders} on {date_today}.")
-        critical = True
+    z = (today_value - median) / mad
+    frac = today_value / median if median != 0 else 0
 
-    orders = float(today.get("orders", 0) or 0)
-    revenue = float(today.get("revenue", 0) or 0)
-    attributed_orders = float(today.get("attributed_orders", 0) or 0)
-    attributed_revenue = float(today.get("attributed_revenue", 0) or 0)
+    if frac < thresholds.crit_drop_fraction and z <= thresholds.crit_z:
+        return "CRITICAL", (
+            f"{metric_name}: {today_value} vs median {median:.2f} "
+            f"(z={z:.2f}, frac={frac:.2f})."
+        )
+    if frac < thresholds.warn_drop_fraction and z <= thresholds.warn_z:
+        return "WARN", (
+            f"{metric_name}: {today_value} vs median {median:.2f} "
+            f"(z={z:.2f}, frac={frac:.2f})."
+        )
 
-    if orders > 0:
-        cov_o = attributed_orders / orders
-        if cov_o < 0.3:
-            alerts.append(
-                f"[WARN] Only {cov_o:.1%} of orders attributed "
-                f"({attributed_orders}/{orders}) on {date_today}."
-            )
-    if revenue > 0:
-        cov_r = attributed_revenue / revenue
-        if cov_r < 0.3:
-            alerts.append(
-                f"[WARN] Only {cov_r:.1%} of revenue attributed "
-                f"({attributed_revenue:.1f}/{revenue:.1f}) on {date_today}."
-            )
+    return "OK", (
+        f"{metric_name}: within normal range (today={today_value}, "
+        f"median={median:.2f}, z={z:.2f}, frac={frac:.2f})."
+    )
 
-    # 3) Funnel sanity (simple thresholds)
-    if all(col in today for col in ["pageviews", "add_to_cart", "checkout_started"]):
-        pv = float(today["pageviews"])
-        ac = float(today["add_to_cart"])
-        cs = float(today["checkout_started"])
 
-        conv = orders / pv if pv > 0 else 0
-        ac_rate = ac / pv if pv > 0 else 0
-        cs_rate = cs / ac if ac > 0 else 0
-        pur_rate = orders / cs if cs > 0 else 0
+# ---------------- Main Monitoring Logic ----------------
 
-        if conv < 0.001:  # <0.1%
-            alerts.append(f"[CRITICAL] Conversion extremely low: {conv:.2%}.")
-            critical = True
-        if ac_rate < 0.01:
-            alerts.append(f"[WARN] Add-to-cart rate low: {ac_rate:.2%}.")
-        if cs_rate < 0.2 and ac > 20:
-            alerts.append(f"[WARN] Checkout-start rate low: {cs_rate:.2%}.")
-        if pur_rate < 0.2 and cs > 20:
-            alerts.append(f"[WARN] Checkout→purchase rate low: {pur_rate:.2%}.")
+def run_monitoring() -> int:
+    engine = get_engine()
+    df = fetch_daily_metrics(engine)
 
-    # --- Output ---
-    if not alerts:
-        print(f"[OK] No issues detected for {date_today}.")
-        sys.exit(0)
+    if df.empty:
+        print("[CRITICAL] daily_metrics returned no rows.")
+        return 1
 
-    print(f"Monitoring report for {date_today}:")
-    for msg in alerts:
-        print("  " + msg)
+    # Ensure we have yesterday's row
+    df["event_date"] = pd.to_datetime(df["event_date"]).dt.date
+    today = pd.Timestamp("today").date()
+    yesterday = today - pd.Timedelta(days=1)
 
-    sys.exit(1 if critical else 0)
+    if yesterday not in set(df["event_date"]):
+        print(f"[CRITICAL] No daily_metrics row for yesterday ({yesterday}).")
+        return 1
+
+    df = df.sort_values("event_date")
+    today_row = df[df["event_date"] == yesterday].iloc[0]
+    baseline = df[df["event_date"] < yesterday]
+
+    if baseline.empty:
+        print("[WARN] No baseline days before yesterday; skipping anomaly detection.")
+        baseline = df[df["event_date"] == yesterday]  # dummy baseline
+
+    thr = Thresholds()
+    has_critical = False
+
+    print(f"=== Monitoring report for {yesterday} ===")
+
+    # 1) Hard checks on core metrics
+    for col in METRICS_VOLUME:
+        val = today_row[col]
+        if pd.isna(val) or val < 0:
+            print(f"[CRITICAL] {col} is null or negative (value={val}).")
+            has_critical = True
+
+    if today_row["orders"] == 0 and today_row["events"] > 0:
+        print(f"[CRITICAL] orders=0 but events={today_row['events']} (likely data issue).")
+        has_critical = True
+
+    # 2) Anomaly checks for volume metrics
+    for col in METRICS_VOLUME:
+        baseline_series = baseline[col]
+        today_val = float(today_row[col])
+        level, msg = check_metric_drop(col, baseline_series, today_val, thr)
+        if level == "CRITICAL":
+            has_critical = True
+            print(f"[CRITICAL] {msg}")
+        elif level == "WARN":
+            print(f"[WARN] {msg}")
+        else:
+            print(f"[OK] {msg}")
+
+    # 3) Funnel metrics & conversion rates
+    users_b = baseline["users"]
+    users_t = float(today_row["users"])
+
+    def safe_rate(num, den):
+        return float(num) / float(den) if den not in (0, None) else 0.0
+
+    # compute conversion rates for baseline and today
+    baseline_add_rate = baseline.apply(
+        lambda r: safe_rate(r["add_to_cart_users"], r["users"]), axis=1
+    )
+    baseline_checkout_rate = baseline.apply(
+        lambda r: safe_rate(r["checkout_users"], r["add_to_cart_users"]), axis=1
+    )
+    baseline_purchase_rate = baseline.apply(
+        lambda r: safe_rate(r["purchase_users"], r["checkout_users"]), axis=1
+    )
+
+    today_add_rate = safe_rate(today_row["add_to_cart_users"], users_t)
+    today_checkout_rate = safe_rate(today_row["checkout_users"], today_row["add_to_cart_users"])
+    today_purchase_rate = safe_rate(today_row["purchase_users"], today_row["checkout_users"])
+
+    for name, baseline_series, today_val in [
+        ("add_rate",      baseline_add_rate,      today_add_rate),
+        ("checkout_rate", baseline_checkout_rate, today_checkout_rate),
+        ("purchase_rate", baseline_purchase_rate, today_purchase_rate),
+    ]:
+        level, msg = check_metric_drop(name, baseline_series, today_val, thr)
+        if level == "CRITICAL":
+            has_critical = True
+            print(f"[CRITICAL] {msg}")
+        elif level == "WARN":
+            print(f"[WARN] {msg}")
+        else:
+            print(f"[OK] {msg}")
+
+    # 4) Attribution sanity
+    orders = float(today_row["orders"])
+    revenue = float(today_row["revenue"])
+
+    for model in ["first_click", "last_click"]:
+        ord_col = f"attributed_orders_{model}"
+        rev_col = f"attributed_revenue_{model}"
+
+        if ord_col not in df.columns or rev_col not in df.columns:
+            print(f"[WARN] Attribution columns for {model} not present; skipping.")
+            continue
+
+        attributed_orders = float(today_row[ord_col] or 0)
+        attributed_revenue = float(today_row[rev_col] or 0)
+
+        if attributed_orders > orders + 1e-6:
+            print(f"[CRITICAL] {model}: attributed_orders ({attributed_orders}) > orders ({orders}).")
+            has_critical = True
+
+        if attributed_revenue > revenue + 1e-6:
+            print(f"[CRITICAL] {model}: attributed_revenue ({attributed_revenue}) > revenue ({revenue}).")
+            has_critical = True
+
+        coverage = safe_rate(attributed_orders, orders) if orders else 0
+        if orders > 0 and coverage < 0.1:  # <10% attributed
+            print(f"[WARN] {model}: only {coverage*100:.1f}% of orders attributed (expected much higher).")
+        else:
+            print(f"[OK] {model}: {coverage*100:.1f}% of orders attributed.")
+
+    if has_critical:
+        print("=== Result: CRITICAL issues detected. Failing job. ===")
+        return 1
+
+    print("=== Result: No critical issues detected. ===")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    exit_code = run_monitoring()
+    sys.exit(exit_code)

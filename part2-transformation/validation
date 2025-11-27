@@ -1,0 +1,158 @@
+I will validate the pipeline at three levels:
+  a. Structural tests (schema & relationships),
+  b. Reconciliation checks (inputs vs outputs),
+  c. Behavioral tests / spot checks (sessionization & attribution logic).
+
+This can be implemented via dbt tests, SQL checks, and a small set of scripted assertions.
+
+5.1 Structural Tests (dbt / SQL Constraints)
+
+    Goal: Ensure each model has the right grain, keys, and relationships.
+
+    Key tests:
+
+      a. stg_events - not_null: user_id, event_ts, event_name.
+      b. fct_session_events - not_null: session_id, Relationship: session_id → fct_sessions.session_id.
+      c. fct_sessions - unique: session_id, not_null: user_id, session_start_ts, session_end_ts.
+      d. dim_users - unique: user_id, Relationship: user_id → stg_events.user_id.
+      e. fct_orders - unique: order_id, not_null: order_id, user_id, order_ts, revenue, Relationship: order_id → stg_events.transaction_id.
+      f. fct_order_attribution - not_null: order_id, model, channel, Relationship: order_id → fct_orders.order_id.
+
+    These can be encoded as dbt tests so they run automatically on every deploy.
+
+5.2 Reconciliation Checks
+
+    Goal: Prove that the transformations preserve the core counts and amounts, and behave as expected.
+
+    5.2.1 Events ↔ Session Events
+    -- event count should not change during sessionization
+        select count(*) as stg_events from stg_events;
+        select count(*) as session_events from fct_session_events;
+
+      These two counts must match. Any difference would mean events were dropped/duplicated in sessionization.
+
+    5.2.2 Purchases ↔ Orders (Counts)
+    -- raw purchase-like events
+        select count(*) as raw_purchase_events
+        from stg_events
+        where event_name in ('purchase', 'checkout_completed')
+        and transaction_id is not null;
+
+    -- deduped orders
+        select count(*) as orders
+        from fct_orders;
+
+    Expectation:
+      orders <= raw_purchase_events (because we collapse multiple events per transaction_id into a single order).
+      If orders > raw_purchase_events, there’s a serious bug; if they are equal, there were no duplicates.
+
+    5.2.3 Purchases ↔ Orders (Revenue)
+    -- sum of revenue at event level
+        select sum(revenue) as raw_purchase_revenue
+        from stg_events
+        where event_name in ('purchase', 'checkout_completed')
+        and transaction_id is not null;
+
+    -- sum of revenue at order level
+        select sum(revenue) as orders_revenue
+        from fct_orders;
+
+    Expectation: 
+      a. orders_revenue should be very close to raw_purchase_revenue.
+      b. Differences only come from:
+        i. Removing clearly invalid rows (e.g., transaction_id null), or
+        ii. Choosing a single revenue value among conflicting duplicates.
+
+      If the gap is large, inspect rows where transaction_id appears multiple times.
+
+    5.2.4 Attribution Coverage
+    -- all orders
+        select count(*) as total_orders,
+        sum(revenue) as total_revenue
+        from fct_orders;
+
+    -- orders with at least one attribution row (per model)
+        select model,
+        count(distinct order_id) as attributed_orders,
+        sum(revenue)              as attributed_revenue
+        from fct_order_attribution
+        group by model;
+
+    Checks:
+        a. attributed_orders <= total_orders.
+        b. attributed_revenue <= total_revenue.
+        c. For a healthy tracking setup, a reasonable fraction of orders should be attributed (e.g. 20–80%). If it suddenly drops to near 0 for a model, attribution logic or touchpoint capture is likely broken.
+
+    5.2.5 Session Aggregation Sanity
+    -- sessions vs session events
+        select count(*) as sessions from fct_sessions;
+        select count(distinct session_id) as session_ids_in_events
+        from fct_session_events;
+
+
+    Counts of sessions should match, and:
+
+    -- check that session start/end timestamps align with events
+        select s.session_id
+        from fct_sessions s
+        join (
+            select session_id,
+                 min(event_ts) as min_ts,
+                 max(event_ts) as max_ts
+            from fct_session_events
+            group by session_id
+        ) e using (session_id)
+        where s.session_start_ts <> e.min_ts
+        or s.session_end_ts   <> e.max_ts;
+  
+    The above query should return 0 rows.
+
+  5.3 Behavioral / Logic Tests
+
+  Goal: Verify that sessionization and attribution behave correctly for specific scenarios.
+
+  I would implement these as:
+    a. Small synthetic input datasets, and
+    b. Expected outputs for each model (like unit tests).
+
+  Examples:
+
+    a. Sessionization test
+        i. Input: events for one user_id at: 10:00, 10:10, 10:20, 11:05 (i.e. 3 events within 30m, 1 after 45m).
+        ii. Expect:
+            a. First three events → session_id = user-1, last event → session_id = user-2.
+    b. Order deduplication test
+        i. Input: two checkout_completed events with same transaction_id, different revenue.
+        ii. Expect:
+            a. fct_orders has one row for that transaction_id.
+            b. revenue equals the max of the two values.
+    c. First vs last-click attribution
+        i. Touches:
+            a. Day 1: Paid Social,
+            b. Day 3: Organic Search,
+            c. Day 6: Email.
+        ii. Order on Day 7.
+        iii. Expect:
+            a. first_click → Paid Social,
+            b. last_click → Email,
+            c. Both with correct revenue.
+
+    These can be automated using dbt seeds / snapshot tests or a Python test harness that:
+    a. Loads the synthetic data into a test schema,
+    b. Runs the SQL models,
+    c. Asserts that outputs match expected tables.
+
+5.4 Automated Daily Validation
+
+  In production, I’d schedule lightweight validation queries after the models run:
+    a. Daily assertion: count(*) stg_events == count(*) fct_session_events.
+    b. Daily assertion: no order_id duplicates in fct_orders.
+    c. Daily assertion: no session_id duplicates in fct_sessions.
+    d. Daily metrics table (daily_metrics) capturing:
+        i. events, sessions, orders, revenue,
+        ii. attributed_orders, attributed_revenue by model.
+
+  On top of this, we can reuse the Part 4 monitoring to trigger alerts if:
+    a. Orders/revenue drop to zero while events are non-zero,
+    b. Attribution coverage collapses,
+    c. Or key conversion rates become extreme.

@@ -1,65 +1,84 @@
-A. High-Level Design
+1. Purpose
 
-Goal: Validate incoming raw event data before it hits production analytics, so broken tracking never silently corrupts revenue dashboards.
+This framework validates raw event data at ingestion time, before it feeds any dashboards or downstream models. The goals are:
 
-Approach:
-•	One reusable Python validator class: EventDataQualityValidator
-•	Input: pandas DataFrame of raw events (from any day / file).
-•	Output: list of DQIssue objects (level = ERROR/WARN, check, message, optional sample rows).
-•	Checks grouped into:
-1.	Schema & timestamps
-2.	Identifiers
-3.	Event names & payloads (purchases)
-4.	Lightweight anomaly detection (volume & revenue)
-You’d run this per batch / partition (e.g. per day) and fail the pipeline on ERRORs, log/notify on WARNs.
- 
+	a. Prevent wrong revenue/funnel numbers from reaching stakeholders.
+	b. Catch instrumentation changes (schema drift, ID renames, new event names) early.
+	c. Provide a generic, reusable set of checks that will also catch future issues, not just the ones in this 14-day incident.
 
-B. What We Check (and Why)
-Area	Check	Why it matters
-Schema	Missing expected columns	Breaks downstream models & joins outright.
-	Unexpected columns (e.g. new IDs)	Surfaces schema drift so transforms can be updated safely.
-Timestamps	timestamp parseable, present	Required for time series, sessions, attribution windows.
-Identifiers	client_id vs clientId schema drift	Silent ID rename breaks user-level funnels & attribution.
-	% events without any ID	High no-ID share → unattributable sessions / revenue.
-Event names	Values outside an expected set	New/renamed events (e.g. checkout_completed) drop from KPIs.
-Purchase payload	event_data valid JSON	Prevents runtime errors / missing revenue.
-	transaction_id & revenue present	Core keys for revenue, deduplication, and order facts.
-	Negative / zero revenue	Catches obvious bugs & test orders.
-	Duplicate transaction_id (+ conflicting rev)	Direct cause of double counting or skewed revenue.
-Anomalies	Daily event volume outliers	Detects partial outages / bot spikes.
-	Daily revenue outliers	Flags sudden drops/spikes even if schema “looks fine”.
- 
+It is implemented as a Python validator class (EventDataQualityValidator) plus a simple CLI.
 
-C. Issues Found in the 14-Day Dataset (23 Feb–8 Mar 2025)
+2. What We Check, and Why
 
-Running the framework on /mnt/data/events_20250223–20250308.csv surfaces:
+The checks are grouped into 5 buckets.
 
-1.	Identifier schema drift (mid-period)
-o	23–26 Feb: client_id populated, clientId all null.
-o	27 Feb–8 Mar: clientId populated, client_id all null.
-o	Framework flags:
-	ERROR: ids.schema.rename (expected client_id, got clientId only for later days).
-	WARN: schema.columns.unexpected (clientId not in original schema).
+	A. Schema & Timestamps
+			Check												Why it matters
+			All expected columns exist							Missing columns break dbt/SQL models and joins.
+			Unexpected columns appear							Early warning for schema drift (e.g. new ID fields).
+			timestamp exists and is parseable					Required for daily partitions, sessionization, attribution.
 
-2.	Rising share of events with no identifier
-o	Early days (23–26 Feb): ~0.5–1.5% events without any ID.
-o	Later days: jumps to 8–16% on several days (e.g. 2 Mar: 15.8%, 8 Mar: 14.3%).
-o	Framework flags WARN/ERROR via ids.missing once the global % exceeds configured thresholds.
+	Reasoning: If schema or timestamps are broken, all downstream logic is untrustworthy. These are hard ERRORs.
 
-3.	Event name mismatch vs spec
-o	Dataset has: page_viewed, email_filled_on_popup, product_added_to_cart, checkout_started, checkout_completed.
-o	No purchase event; purchase-equivalent is checkout_completed.
-o	Framework flags WARN: event_name.unknown_values so teams can update mappings rather than silently losing purchases from dashboards expecting purchase.
+	B. Identifiers (User / Device)
+			Check												Why it matters
+			Presence of client_id / clientId					Detects ID renames that would break user-level metrics.
+			% of events with no identifier at all				High “no ID” share → unattributable traffic & revenue.
+			Both client_id and clientId together				Signals inconsistent tracking that can confuse transformations.
 
-4.	Zero-revenue orders (likely tests)
-o	294 checkout_completed events; 10 have revenue = 0 (3.4%).
-o	Framework raises WARN: purchase.revenue.zero_fraction with sample rows.
+	Reasoning: Reliable attribution and funnels depend on stable IDs. Large gaps or renames are pipeline-blocking issues.
 
-5.	Duplicate transaction_ids, with conflicting revenue
-o	4 duplicate IDs: ORD-20250226-400, ORD-20250227-262, ORD-20250301-176, ORD-20250308-149.
-o	3 of them have different revenue values across duplicates (e.g. ORD-20250226-400 = 1524 vs 3199).
-o	Framework flags:
-	WARN: purchase.transaction_id.duplicates (dedup needed), and
-	ERROR: purchase.transaction_id.conflicting_revenue.
+	C. Event Names & Critical Events
+			Check												Why it matters
+			Unknown event_name values vs a spec list			Flags new/renamed events that must be mapped (e.g. checkout_completed).
+			Critical events present (e.g. page_viewed)			If they disappear, conversion metrics silently collapse.
 
-These are exactly the kinds of issues that would make a mid-period revenue dashboard look “wrong”, and the framework is generic enough to catch future variants (other renames, payload bugs, anomaly days) without being hard-coded to just this incident.
+	Reasoning: Revenue and funnel logic often filter on event_name. Silent changes here are a common cause of broken dashboards.
+
+	D. Purchase / Revenue Payload
+
+	For events that represent purchases (purchase and checkout_completed):
+
+			Check												Why it matters
+			event_data parses as JSON / dict					Prevents parse failures and missing revenue.
+			transaction_id present								Needed to deduplicate orders and join later.
+			revenue present and non-negative					Direct input into revenue reporting.
+			Share of zero-revenue purchases						Catches test events / partial integrations.
+			Duplicate transaction_ids							Prevents double-counting orders.
+			Conflicting revenue per transaction_id				Detects data corruption for specific orders.
+
+	Reasoning: This is where the mid-period revenue bug came from. These checks guarantee that “money events” are structurally sound.
+
+	E. Anomaly Detection (Volume & Revenue)
+
+	Over daily aggregates (when validating multiple days together):
+
+		a. Daily event volume vs rolling median (MAD-based outlier detection).
+		b. Daily purchase revenue vs rolling median (same method).
+		
+	These are WARN-only to avoid alert fatigue.
+	Reasoning: Even if schema looks fine, sudden drops or spikes in events or revenue usually indicate broken tracking, tagging, or outages.
+
+3. Issues Identified in the 14-Day Dataset
+
+Applied to the provided 14 days, the framework flagged:
+
+	A. ID rename / drift:
+		Early days use client_id, later days use clientId.
+		Framework flags id.schema_rename and id.both_id_columns / id.missing.
+
+	B. Rising share of events with no ID:
+		Later days show significantly more events with neither client_id nor clientId.
+		Framework flags this via id.missing once thresholds are exceeded.
+
+	C. Purchase event name mismatch:
+		Spec expects purchase, but raw data uses checkout_completed.
+		Framework raises event_name.unknown_values and event_name.missing_critical.
+
+	D. Zero-revenue purchase events:
+		A non-trivial fraction of purchase events has revenue = 0.
+		Framework warns via purchase.zero_revenue_fraction.
+
+	E. Duplicate transaction IDs with conflicting revenue:
+		Some transaction_ids appear multiple times with different revenue amounts.
+		Framework warns on purchase.duplicate_transaction_ids and raises an ERROR on purchase.conflicting_revenue.
